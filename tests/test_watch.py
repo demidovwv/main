@@ -14,7 +14,7 @@ from avito_watch import (Item, Store, Telegram, TelegramProblem, PageProblem,
                          classify, parse_search, parse_description, make_search, scan_loop, Gate,
                          AccessLimited, AccessPaused, retry_after_seconds, navigate, browser_settings,
                          collect_search, request_info, detail_loop, Roster, scan_lane, load_config,
-                         message, SearchRead)
+                         message, SearchRead, release_old_pause, stretch_pace)
 
 
 def sample(id="1234567890", title="Железное пламя", **kwargs):
@@ -472,27 +472,23 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
-    async def test_second_429_requires_manual_action_and_resume_keeps_deadline(self):
+    async def test_repeated_429_keeps_running_and_a_hard_block_still_needs_resume(self):
         gate = Gate(0)
         with patch("avito_watch.time.time", return_value=1000):
             gate.block(AccessLimited("HTTP 429"))
+            self.assertFalse(gate.state["manual"])
         with patch("avito_watch.time.time", return_value=1901):
-            # After cooldown a description cannot take the recovery probe.
+            # Descriptions wait while the limit is remembered; the search itself may continue.
             with self.assertRaises(AccessPaused):
                 gate.check(search=False)
             gate.check(search=True)
-            gate.block(AccessLimited("HTTP 429"))
-            self.assertTrue(gate.state["manual"])
-            gate.resume()
+            gate.block(AccessLimited("HTTP 429", retry_after=50))
             self.assertFalse(gate.state["manual"])
-            with self.assertRaises(AccessPaused):
-                gate.check()  # --resume did not override the deadline.
-        with patch("avito_watch.time.time", return_value=5000):
+            self.assertEqual(gate.state["until"], 1951)
+        gate.block(AccessLimited("HTTP 403", manual=True))
+        self.assertTrue(gate.state["manual"])
+        with self.assertRaises(AccessPaused):
             gate.check()
-            gate.inconclusive_probe()
-            self.assertTrue(gate.state["manual"])
-            with self.assertRaises(AccessPaused):
-                gate.check()
 
     async def test_successful_search_clears_recovery_and_403_requires_manual_check(self):
         gate = Gate(0)
@@ -546,7 +542,7 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
                 normal_gate.announce_pause()
                 self.assertEqual(store.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 2)
                 first = store.next_delivery()
-                self.assertIn("Общая остановка", first["body"])
+                self.assertIn("обновит страницу сама", first["body"])
                 store.delivered(first, 101)
                 second = store.next_delivery()
                 store.delivered(second, 102)
@@ -653,6 +649,51 @@ class StableScheduleTests(unittest.IsolatedAsyncioTestCase):
         for previous, current in zip(kinds, kinds[1:]):
             if previous == "S":
                 self.assertEqual(current, "P")
+
+    def test_old_manual_pause_releases_and_timeout_lengthens_interval(self):
+        gate = Gate(0)
+        gate.state = {"manual": True, "until": time.time() + 3600, "strikes": 1, "reason": "старая пауза"}
+        self.assertTrue(release_old_pause(gate))
+        self.assertFalse(gate.state["manual"])
+        self.assertEqual(gate.state["until"], 0)
+        gate.check(search=True)
+
+    async def test_timeout_lengthens_the_refresh_and_does_not_stop(self):
+        stop = asyncio.Event()
+
+        async def time_out(page, url, gate, search):
+            raise TimeoutError("page.goto")
+
+        class Page:
+            async def content(self):
+                return ""
+
+        class Context:
+            async def new_page(self):
+                return Page()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "t.db")
+            search = make_search({"query": "Железное пламя", "interval_seconds": 45}, 45)
+            config = {"search_concurrency": 1, "notify_candidates": False, "fetch_descriptions": False,
+                      "max_secondary_per_cycle": 1, "interval_cap_seconds": 120, "interval_step_seconds": 15,
+                      "searches": [search]}
+            roster = Roster(config["searches"])
+            gate = Gate(0, store, ["11"])
+
+            async def stopper():
+                await asyncio.sleep(0.3)
+                stop.set()
+
+            try:
+                with patch("avito_watch.navigate", time_out):
+                    await asyncio.gather(scan_lane(
+                        Context(), store, config, ["11"], gate, stop, "baseline", roster), stopper())
+                self.assertEqual(search["interval"], 60)
+                self.assertFalse(gate.state.get("manual", False))
+                self.assertGreater(gate.state.get("until", 0), time.time())
+            finally:
+                store.close()
 
     async def test_description_waits_while_priority_search_is_due(self):
         context = type("Context", (), {"new_page": AsyncMock(return_value=object())})()

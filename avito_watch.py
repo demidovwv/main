@@ -522,19 +522,24 @@ class Gate:
                   if request else " ")
         return (f"Причина: {self.state.get('reason', 'ограничение')}." + source + f"Следующая попытка не раньше {label}. "
                 + ("Автопроверки остановлены; нужна ручная проверка и --resume."
-                   if self.state.get("manual") else "После паузы допускается одна проверка поиска."))
+                   if self.state.get("manual") else "Дальше программа обновит страницу сама, с более длинным интервалом."))
 
     def block(self, exc: AccessLimited):
         exc.handled = True
         strikes = int(self.state.get("strikes", 0)) + 1
         episode = self.state.get("episode") or str(time.time_ns())
-        delay = max(self.cooldown * 2**min(strikes-1, 4), exc.retry_after)
+        # 429 means the refresh was too fast. Wait for Retry-After if Avito sent one,
+        # then continue. Captcha, 403 and 439 still need a person.
+        delay = max(self.cooldown * 2**min(strikes-1, 4), exc.retry_after) if exc.manual else max(0.0, exc.retry_after)
         self.state = {"strikes": strikes, "episode": episode,
                       "until": max(self.state.get("until", 0), time.time()+delay),
-                      "manual": bool(exc.manual or strikes >= 2), "reason": str(exc),
+                      "manual": bool(exc.manual), "reason": str(exc),
                       "request": dict(exc.request)}
         self.persist()
-        LOG.warning("Все обращения к Авито остановлены. %s", self.describe())
+        if exc.manual:
+            LOG.warning("Все обращения к Авито остановлены. %s", self.describe())
+        else:
+            LOG.info("Авито ограничил частоту. Обновление продолжится само, интервал станет чуть длиннее. %s", self.describe())
         self.announce_pause()
 
     def announce_pause(self):
@@ -542,18 +547,23 @@ class Gate:
         if self.store and self.chats and self.recovering:
             # Stable keys survive a restart. Not one notification per query.
             suffix = ":manual" if self.state["manual"] else ":pause"
-            self.store.notice("avito-access:"+self.state["episode"]+suffix,
-                "⚠️ Общая остановка поиска Авито\n" + self.describe()
+            title = "⚠️ Общая остановка поиска Авито\n" if self.state.get("manual") else "⏸ Авито просит обновлять реже\n"
+            self.store.notice("avito-access:"+self.state["episode"]+suffix, title + self.describe()
                 + "\nНовые объявления во время паузы не проверяются. Telegram продолжает работать.", self.chats)
 
+    def ease(self, seconds: float):
+        """Keep the shared pause at least `seconds` long without asking for --resume."""
+        self.state["manual"] = False
+        self.state["until"] = max(float(self.state.get("until", 0)), time.time() + seconds)
+        self.state["reason"] = f"Обновление через {int(seconds)} с"
+        self.persist()
+
     def inconclusive_probe(self):
+        # A timeout or unrecognized page is not a permanent stop. The search loop
+        # lengthens its own interval and opens the page again.
         if self.recovering and not self.state.get("manual"):
-            self.state["manual"] = True
-            self.state["reason"] = "Пробная проверка после ограничения не дала распознанной выдачи"
+            self.state["reason"] = "Страница поиска не открылась, следующая проверка будет позже"
             self.persist()
-            if self.store:
-                self.store.notice("avito-access:"+self.state["episode"]+":manual",
-                                  "⚠️ " + self.describe(), self.chats)
 
     def confirm_success(self):
         if self.recovering:
@@ -600,6 +610,31 @@ class Gate:
             finally:
                 LOG.info("Авито END | тип=%s | цель=%s | длительность=%.1f с | URL=%s",
                          request["type"], request["label"], time.monotonic()-self.last, request["url"])
+
+
+def release_old_pause(gate: Gate) -> bool:
+    """Start the browser even if an older run left a manual stop in the database."""
+    paused = bool(gate.state.get("manual")) or float(gate.state.get("until", 0)) > time.time()
+    if not paused:
+        return False
+    gate.state["manual"] = False
+    gate.state["until"] = 0
+    gate.persist()
+    return True
+
+
+def stretch_pace(store: Store, roster: Roster, search: dict, cap: float, step: float) -> float:
+    """Lengthen one search a little after Avito refuses or the page does not load."""
+    base = float(search.get("base_interval", search["interval"]))
+    ceiling = max(base, cap)
+    if search["interval"] < ceiling:
+        search["interval"] = min(ceiling, float(search["interval"]) + step)
+    roster.interval[search["key"]] = search["interval"]
+    saved = store.get_state("poll_pace")
+    saved[search["key"]] = search["interval"]
+    store.set_state("poll_pace", saved)
+    LOG.info("Интервал «%s» увеличен до %s с", search["query"], int(search["interval"]))
+    return float(search["interval"])
 
 
 READY_JS = """() => !!document.querySelector('[data-marker="item"]') ||
@@ -703,7 +738,7 @@ def make_search(entry: dict, default_interval: float) -> dict:
     if interval < 30:
         LOG.warning("Интервал «%s» увеличен до 30 с: более частые обновления снова приводят к ограничению Авито", query)
         interval = 30
-    return {"query": query, "url": url, "interval": interval,
+    return {"query": query, "url": url, "interval": interval, "base_interval": interval,
             "key": hashlib.sha256(url.encode()).hexdigest()}
 
 
@@ -837,9 +872,18 @@ async def scan_lane(context, store: Store, config: dict, chats: list[str], gate:
     """One browser tab. Priority search keeps its interval; other searches take at most
     one turn in each gap, so eight queries cannot stampede Avito."""
     page = await context.new_page()
-    meta = {search["key"]: {"errors": 0, "episode": str(int(time.time())), "last_ok": 0.0}
+    meta = {search["key"]: {"errors": 0, "episode": str(int(time.time())), "last_ok": 0.0, "ok_streak": 0}
             for search in config["searches"]}
     searches = {search["key"]: search for search in config["searches"]}
+    saved_pace = store.get_state("poll_pace")
+    cap = float(config.get("interval_cap_seconds", 120))
+    step = float(config.get("interval_step_seconds", 15))
+    for search in config["searches"]:
+        base = float(search.get("base_interval", search["interval"]))
+        search["base_interval"] = base
+        if search["key"] in saved_pace:
+            search["interval"] = min(max(base, cap), max(base, float(saved_pace[search["key"]])))
+            roster.interval[search["key"]] = search["interval"]
     limit = int(config.get("max_secondary_per_cycle", 1))
     while not stop.is_set():
         key = roster.choose(gate.gap, limit)
@@ -857,6 +901,17 @@ async def scan_lane(context, store: Store, config: dict, chats: list[str], gate:
             try:
                 roster.set_due(key, await poll_search(
                     page, store, config, chats, gate, first_run, search, meta[key]))
+                info = meta[key]
+                info["ok_streak"] = info.get("ok_streak", 0) + 1
+                floor = float(search.get("base_interval", search["interval"]))
+                if info["ok_streak"] >= 3 and search["interval"] > floor:
+                    search["interval"] = max(floor, float(search["interval"]) - step)
+                    roster.interval[key] = search["interval"]
+                    pace = store.get_state("poll_pace")
+                    pace[key] = search["interval"]
+                    store.set_state("poll_pace", pace)
+                    info["ok_streak"] = 0
+                    LOG.info("Интервал «%s» уменьшен до %s с", search["query"], int(search["interval"]))
             except asyncio.CancelledError:
                 raise
             except AccessPaused as exc:
@@ -865,9 +920,23 @@ async def scan_lane(context, store: Store, config: dict, chats: list[str], gate:
                 if not exc.handled:
                     exc.request = request_info(search["url"], True)
                     gate.block(exc)
-                roster.set_due(key, time.monotonic() + 1)
+                meta[key]["ok_streak"] = 0
+                if exc.manual:
+                    roster.set_due(key, time.monotonic() + 1)
+                else:
+                    wait_s = max(stretch_pace(store, roster, search, cap, step), float(exc.retry_after or 0))
+                    gate.ease(wait_s)
+                    roster.set_due(key, time.monotonic() + wait_s)
             except Exception as exc:
-                roster.set_due(key, fail_search(store, gate, search, meta[key], exc, chats))
+                meta[key]["ok_streak"] = 0
+                if type(exc).__name__ == "TimeoutError":
+                    wait_s = stretch_pace(store, roster, search, cap, step)
+                    gate.ease(wait_s)
+                    roster.set_due(key, time.monotonic() + wait_s)
+                    LOG.warning("Страница «%s» не загрузилась. Следующее обновление через %s с",
+                                search["query"], int(wait_s))
+                else:
+                    roster.set_due(key, fail_search(store, gate, search, meta[key], exc, chats))
         finally:
             roster.busy = False
 
@@ -899,6 +968,8 @@ def load_config(path: Path) -> dict:
     config["detail_retry_seconds"] = max(900, float(config.get("detail_retry_seconds", 900)))
     config["detail_min_gap_seconds"] = max(60, float(config.get("detail_min_gap_seconds", 60)))
     config["max_secondary_per_cycle"] = max(0, min(2, int(config.get("max_secondary_per_cycle", 1))))
+    config["interval_step_seconds"] = max(15, float(config.get("interval_step_seconds", 15)))
+    config["interval_cap_seconds"] = max(60, float(config.get("interval_cap_seconds", 120)))
     return config
 
 
@@ -1121,6 +1192,8 @@ async def run(args):
                         loop.add_signal_handler(sig, stop.set)
                 bot = Telegram(token)
                 gate.announce_pause()
+                if release_old_pause(gate):
+                    LOG.info("Старая пауза снята. Браузер откроется и сам продолжит обновлять поиск.")
                 roster = Roster(config["searches"])
                 for search in config["searches"]:
                     delay = max(0.0, roster.due[search["key"]] - time.monotonic())
@@ -1128,7 +1201,7 @@ async def run(args):
                              search["query"], int(search["interval"]), delay,
                              "; приоритет, ссылка уходит сразу" if search["key"] == roster.primary else "")
                 primary = next(search for search in config["searches"] if search["key"] == roster.primary)
-                LOG.info("Мониторинг 1.6 запущен. Приоритетный поиск «%s» каждые %s с; "
+                LOG.info("Мониторинг 1.7 запущен. Приоритетный поиск «%s» каждые %s с; "
                          "между этими проверками не больше %s остальных запросов. "
                          "Описания: %s. Возможные варианты без подтверждения: %s.",
                          primary["query"], int(primary["interval"]),
@@ -1149,7 +1222,7 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Быстрые уведомления о книгах Авито → Telegram")
-    parser.add_argument("--version", action="version", version="Avito Book Watch 1.6 — priority search every 30–60s, one secondary between cycles")
+    parser.add_argument("--version", action="version", version="Avito Book Watch 1.7 — refresh every 45s and lengthen the interval when Avito refuses")
     parser.add_argument("--config", type=Path, default=BASE / "config.json")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--probe", action="store_true", help="Один поиск без рассылки/начальной базы; состояние ограничения сохраняется")
