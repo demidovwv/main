@@ -1127,9 +1127,14 @@ async def run(args):
                     LOG.info("Поиск «%s»: каждые %s с, первая проверка через %.0f с%s",
                              search["query"], int(search["interval"]), delay,
                              "; приоритет, ссылка уходит сразу" if search["key"] == roster.primary else "")
-                LOG.info("Мониторинг 1.6 запущен. Приоритетный поиск не чаще заданного интервала "
-                         "и не чаще одного дополнительного поиска в промежутке. "
-                         "Новая ссылка ставится в Telegram сразу, не дожидаясь остальных запросов.")
+                primary = next(search for search in config["searches"] if search["key"] == roster.primary)
+                LOG.info("Мониторинг 1.6 запущен. Приоритетный поиск «%s» каждые %s с; "
+                         "между этими проверками не больше %s остальных запросов. "
+                         "Описания: %s. Возможные варианты без подтверждения: %s.",
+                         primary["query"], int(primary["interval"]),
+                         config.get("max_secondary_per_cycle", 1),
+                         "включены" if config.get("fetch_descriptions", True) else "выключены",
+                         "включены" if config.get("notify_candidates", True) else "выключены")
                 try:
                     async with asyncio.TaskGroup() as tasks:
                         tasks.create_task(scan_loop(context, store, config, chats, gate, stop, args.first_run, roster))

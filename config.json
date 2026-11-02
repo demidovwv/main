@@ -2,7 +2,7 @@
   "interval_seconds": 300,
   "navigation_gap_seconds": 8,
   "search_concurrency": 1,
-  "notify_candidates": true,
+  "notify_candidates": false,
   "max_secondary_per_cycle": 1,
   "searches": [
     {
@@ -39,7 +39,7 @@
     }
   ],
   "cooldown_seconds": 900,
-  "fetch_descriptions": true,
+  "fetch_descriptions": false,
   "detail_max_attempts": 2,
   "detail_retry_seconds": 900,
   "detail_min_gap_seconds": 60
