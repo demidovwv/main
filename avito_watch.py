@@ -735,9 +735,9 @@ def make_search(entry: dict, default_interval: float) -> dict:
         query = urlsplit(url).path
     url = avito_url(url)
     interval = float(entry.get("interval_seconds", default_interval))
-    if interval < 30:
-        LOG.warning("Интервал «%s» увеличен до 30 с: более частые обновления снова приводят к ограничению Авито", query)
-        interval = 30
+    if interval < 60:
+        LOG.warning("Интервал «%s» увеличен до 1 минуты: чаще Авито обновлять не нужно", query)
+        interval = 60
     return {"query": query, "url": url, "interval": interval, "base_interval": interval,
             "key": hashlib.sha256(url.encode()).hexdigest()}
 
@@ -1201,7 +1201,7 @@ async def run(args):
                              search["query"], int(search["interval"]), delay,
                              "; приоритет, ссылка уходит сразу" if search["key"] == roster.primary else "")
                 primary = next(search for search in config["searches"] if search["key"] == roster.primary)
-                LOG.info("Мониторинг 1.7 запущен. Приоритетный поиск «%s» каждые %s с; "
+                LOG.info("Мониторинг 1.8 запущен. Приоритетный поиск «%s» каждые %s с; "
                          "между этими проверками не больше %s остальных запросов. "
                          "Описания: %s. Возможные варианты без подтверждения: %s.",
                          primary["query"], int(primary["interval"]),
@@ -1222,7 +1222,7 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Быстрые уведомления о книгах Авито → Telegram")
-    parser.add_argument("--version", action="version", version="Avito Book Watch 1.7 — refresh every 45s and lengthen the interval when Avito refuses")
+    parser.add_argument("--version", action="version", version="Avito Book Watch 1.8 — refresh the priority search every 2 minutes")
     parser.add_argument("--config", type=Path, default=BASE / "config.json")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--probe", action="store_true", help="Один поиск без рассылки/начальной базы; состояние ограничения сохраняется")

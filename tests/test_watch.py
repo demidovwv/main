@@ -555,7 +555,7 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
 class StableScheduleTests(unittest.IsolatedAsyncioTestCase):
     def test_fast_interval_is_raised_and_config_floor_stays_stable(self):
         with self.assertLogs("avito-watch", level="WARNING"):
-            self.assertEqual(make_search({"query": "x", "interval_seconds": 5}, 30)["interval"], 30)
+            self.assertEqual(make_search({"query": "x", "interval_seconds": 5}, 30)["interval"], 60)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(json.dumps({
@@ -565,14 +565,14 @@ class StableScheduleTests(unittest.IsolatedAsyncioTestCase):
                 "detail_min_gap_seconds": 5,
                 "max_secondary_per_cycle": 9,
                 "searches": [
-                    {"query": "Железное пламя", "interval_seconds": 45},
+                    {"query": "Железное пламя", "interval_seconds": 120},
                     {"query": "Яррос"},
                 ],
             }), encoding="utf-8")
             config = load_config(path)
-        self.assertEqual(config["searches"][0]["interval"], 45)
+        self.assertEqual(config["searches"][0]["interval"], 120)
         self.assertEqual(config["searches"][0]["query"], "Железное пламя")
-        self.assertGreaterEqual(config["searches"][1]["interval"], 30)
+        self.assertGreaterEqual(config["searches"][1]["interval"], 60)
         self.assertGreaterEqual(config["navigation_gap_seconds"], 8)
         self.assertEqual(config["search_concurrency"], 1)
         self.assertGreaterEqual(config["detail_min_gap_seconds"], 60)
@@ -674,9 +674,9 @@ class StableScheduleTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "t.db")
-            search = make_search({"query": "Железное пламя", "interval_seconds": 45}, 45)
+            search = make_search({"query": "Железное пламя", "interval_seconds": 120}, 120)
             config = {"search_concurrency": 1, "notify_candidates": False, "fetch_descriptions": False,
-                      "max_secondary_per_cycle": 1, "interval_cap_seconds": 120, "interval_step_seconds": 15,
+                      "max_secondary_per_cycle": 1, "interval_cap_seconds": 180, "interval_step_seconds": 15,
                       "searches": [search]}
             roster = Roster(config["searches"])
             gate = Gate(0, store, ["11"])
@@ -689,7 +689,7 @@ class StableScheduleTests(unittest.IsolatedAsyncioTestCase):
                 with patch("avito_watch.navigate", time_out):
                     await asyncio.gather(scan_lane(
                         Context(), store, config, ["11"], gate, stop, "baseline", roster), stopper())
-                self.assertEqual(search["interval"], 60)
+                self.assertEqual(search["interval"], 135)
                 self.assertFalse(gate.state.get("manual", False))
                 self.assertGreater(gate.state.get("until", 0), time.time())
             finally:

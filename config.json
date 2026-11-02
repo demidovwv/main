@@ -9,7 +9,7 @@
   "searches": [
     {
       "query": "Железное пламя",
-      "interval_seconds": 45
+      "interval_seconds": 120
     },
     {
       "query": "Четвёртое крыло",
