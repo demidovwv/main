@@ -1,0 +1,18 @@
+services:
+  watcher:
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+    env_file: .env
+    shm_size: "1gb"
+    volumes:
+      - watcher_data:/app/data
+      - ./config.json:/app/config.json:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  watcher_data:

@@ -1,0 +1,7 @@
+Version 1.6, 02.11.2026
+37 offline tests passed; Python compilation and --version passed.
+Schedule: priority search at 45s, other searches one per gap and initially spread, descriptions yield while a search is due, intervals below 30s are raised.
+New regressions: exact failed request type/URL in persisted access pause and logs; START/END context; session-like URL parameter redaction; disabled description worker makes no browser tab and keeps its queue; markup errors terminate; transient timeout allows one delayed retry; attempt budget survives restart; old exhausted jobs are not reopened.
+All previous persistent-profile, DOM reading, filtering, delivery and rate-limit tests passed.
+Remote /workspace/avito-iron-flame/watcher/watch.log is not available in this workspace. Analysis used the supplied excerpt and the delivered source.
+Real Avito access and deployment on the agent desktop remain unverified here. Diagnostics identify the refused request, not the ultimate cause of a server-side limit.
