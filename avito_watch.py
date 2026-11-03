@@ -354,11 +354,26 @@ class Store:
             self.db.execute("UPDATE details SET done=1 WHERE item_id=?", (item.id,))
 
     def notice(self, key: str, text: str, chats: list[str]):
-        # One message per failure episode. Persistent state avoids restart spam.
+        """One service message per key. A restart of the same pause does not queue another."""
         item_id = "notice:" + key
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO items VALUES(?,?,?,1,1)", (item_id, "{}", text))
-            self._queue(item_id, chats)
+            exists = self.db.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
+            rows = self.db.execute(
+                "SELECT chat_id, disabled, sent_revision, message_id FROM outbox WHERE item_id=?",
+                (item_id,)).fetchall() if exists else []
+            known = {row["chat_id"] for row in rows}
+            missing = [chat for chat in chats if chat not in known]
+            if exists and not missing:
+                details = ", ".join(
+                    f"chat={row['chat_id']} disabled={row['disabled']} sent_revision={row['sent_revision']} "
+                    f"message_id={row['message_id']}" for row in rows) or "записей очереди нет"
+                LOG.info("Повтор служебного уведомления подавлен: ключ=%s; %s", key, details)
+                return
+            if not exists:
+                self.db.execute("INSERT INTO items VALUES(?,?,?,1,1)", (item_id, "{}", text))
+            self._queue(item_id, missing or chats)
+            LOG.info("Служебное уведомление поставлено в очередь: ключ=%s; получатели=%s",
+                     key, ",".join(missing or chats))
 
     def next_delivery(self):
         return self.db.execute("""SELECT o.*,i.body,i.revision FROM outbox o JOIN items i ON i.id=o.item_id
@@ -462,6 +477,14 @@ async def wait(stop: asyncio.Event, seconds: float):
         await asyncio.wait_for(stop.wait(), timeout=max(0.01, seconds))
 
 
+def log_disabled_deliveries(store: Store):
+    rows = store.db.execute(
+        "SELECT item_id, chat_id, tries FROM outbox WHERE disabled=1 ORDER BY rowid").fetchall()
+    for row in rows:
+        LOG.error("Очередь Telegram отключена: item=%s; chat=%s; попыток=%s",
+                  row["item_id"], row["chat_id"], row["tries"])
+
+
 async def deliver_loop(store: Store, telegram: Telegram, stop: asyncio.Event):
     while not stop.is_set():
         row = store.next_delivery()
@@ -474,8 +497,8 @@ async def deliver_loop(store: Store, telegram: Telegram, stop: asyncio.Event):
             permanent = exc.code in (400, 401, 403, 404)
             delay = max(exc.retry_after, min(300, 2 ** min(row["tries"]+1, 8)))
             store.delivery_failed(row, delay, permanent)
-            LOG.error("Telegram: код %s; %s", exc.code,
-                      "отправка этой записи остановлена, проверьте токен/chat_id" if permanent else "будет повтор")
+            LOG.error("Telegram: код %s; запись %s; chat %s; %s", exc.code, row["item_id"], row["chat_id"],
+                      "отправка остановлена, запись очереди отключена" if permanent else "будет повтор")
         else:
             store.delivered(row, mid)
             LOG.info("Telegram: %s %s → %s", "обновлено" if row["message_id"] else "отправлено",
@@ -522,48 +545,85 @@ class Gate:
                   if request else " ")
         return (f"Причина: {self.state.get('reason', 'ограничение')}." + source + f"Следующая попытка не раньше {label}. "
                 + ("Автопроверки остановлены; нужна ручная проверка и --resume."
-                   if self.state.get("manual") else "Дальше программа обновит страницу сама, с более длинным интервалом."))
+                   if self.state.get("manual") else "После паузы допускается одна проверка поиска."))
+
+    def pause_notice_key(self) -> str:
+        permit = int(self.state.get("permit", 0) or 0)
+        suffix = "manual" if self.state.get("manual") else "pause"
+        return f"avito-access:{self.state['episode']}:p{permit}:{suffix}"
+
+    def legacy_notice_keys(self) -> list[str]:
+        episode = self.state.get("episode")
+        if not episode:
+            return []
+        return [f"avito-access:{episode}:pause", f"avito-access:{episode}:manual"]
+
+    def notice_queued(self, key: str) -> bool:
+        if not self.store or not key:
+            return False
+        return self.store.db.execute(
+            "SELECT 1 FROM items WHERE id=?", ("notice:" + key,)).fetchone() is not None
+
+    def remember_notice_key(self) -> str:
+        """Keep the key of the pause already announced, including a pre-1.9 key.
+
+        A restart must not invent a fresh key for the same stop. A later failure
+        after --resume replaces this field with pause_notice_key().
+        """
+        stored = self.state.get("notice_key")
+        if stored:
+            return stored
+        current = self.pause_notice_key()
+        key = current
+        for candidate in (current, *self.legacy_notice_keys()):
+            if self.notice_queued(candidate):
+                key = candidate
+                LOG.info("Повтор остановки привязан к уже записанному уведомлению: ключ=%s", key)
+                break
+        self.state["notice_key"] = key
+        return key
 
     def block(self, exc: AccessLimited):
         exc.handled = True
-        strikes = int(self.state.get("strikes", 0)) + 1
+        previous_until = float(self.state.get("until", 0) or 0)
+        previous_manual = bool(self.state.get("manual", False))
+        strikes = int(self.state.get("strikes", 0) or 0) + 1
         episode = self.state.get("episode") or str(time.time_ns())
-        # 429 means the refresh was too fast. Wait for Retry-After if Avito sent one,
-        # then continue. Captcha, 403 and 439 still need a person.
-        delay = max(self.cooldown * 2**min(strikes-1, 4), exc.retry_after) if exc.manual else max(0.0, exc.retry_after)
-        self.state = {"strikes": strikes, "episode": episode,
-                      "until": max(self.state.get("until", 0), time.time()+delay),
-                      "manual": bool(exc.manual), "reason": str(exc),
-                      "request": dict(exc.request)}
+        permit = int(self.state.get("permit", 0) or 0)
+        delay = max(self.cooldown * 2**min(strikes - 1, 4), float(exc.retry_after or 0))
+        until = max(previous_until, time.time() + delay)
+        manual = previous_manual or bool(exc.manual) or strikes >= 2
+        self.state = {"strikes": strikes, "episode": episode, "permit": permit,
+                      "until": until, "manual": manual, "reason": str(exc),
+                      "request": dict(exc.request or {})}
+        self.state["notice_key"] = self.pause_notice_key()
         self.persist()
-        if exc.manual:
-            LOG.warning("Все обращения к Авито остановлены. %s", self.describe())
-        else:
-            LOG.info("Авито ограничил частоту. Обновление продолжится само, интервал станет чуть длиннее. %s", self.describe())
+        LOG.warning("Все обращения к Авито остановлены. %s", self.describe())
         self.announce_pause()
 
     def announce_pause(self):
-        """Attach recipients to a pause originally created by a silent --probe."""
+        """One notice per stored pause key. A new key appears only after a new failure."""
         if self.store and self.chats and self.recovering:
-            # Stable keys survive a restart. Not one notification per query.
-            suffix = ":manual" if self.state["manual"] else ":pause"
-            title = "⚠️ Общая остановка поиска Авито\n" if self.state.get("manual") else "⏸ Авито просит обновлять реже\n"
-            self.store.notice("avito-access:"+self.state["episode"]+suffix, title + self.describe()
+            had_key = bool(self.state.get("notice_key"))
+            key = self.remember_notice_key()
+            if not had_key:
+                self.persist()
+            self.store.notice(key, "⚠️ Общая остановка поиска Авито\n" + self.describe()
                 + "\nНовые объявления во время паузы не проверяются. Telegram продолжает работать.", self.chats)
 
-    def ease(self, seconds: float):
-        """Keep the shared pause at least `seconds` long without asking for --resume."""
-        self.state["manual"] = False
-        self.state["until"] = max(float(self.state.get("until", 0)), time.time() + seconds)
-        self.state["reason"] = f"Обновление через {int(seconds)} с"
-        self.persist()
-
     def inconclusive_probe(self):
-        # A timeout or unrecognized page is not a permanent stop. The search loop
-        # lengthens its own interval and opens the page again.
+        """A recovery search that did not confirm access stops until --resume.
+
+        The stored reason and deadline stay as Gate.block left them.
+        """
         if self.recovering and not self.state.get("manual"):
-            self.state["reason"] = "Страница поиска не открылась, следующая проверка будет позже"
+            self.state["manual"] = True
+            if not self.state.get("reason"):
+                self.state["reason"] = "Пробная проверка после ограничения не дала распознанной выдачи"
+            self.state["notice_key"] = self.pause_notice_key()
             self.persist()
+            LOG.warning("Пробная проверка не подтвердила доступ. Причина и срок остановки сохранены. %s", self.describe())
+            self.announce_pause()
 
     def confirm_success(self):
         if self.recovering:
@@ -576,10 +636,15 @@ class Gate:
                     "Это не гарантия отсутствия дальнейших ограничений.", self.chats)
 
     def resume(self):
-        # A user-confirmed manual check does not override Retry-After/cooldown.
+        # A user-confirmed manual check does not override Retry-After/cooldown
+        # and does not by itself queue another Telegram message.
         if self.recovering:
+            self.remember_notice_key()
             self.state["manual"] = False
+            self.state["permit"] = int(self.state.get("permit", 0) or 0) + 1
             self.persist()
+            LOG.info("Ручной запрет снят. Срок паузы и счётчик ограничений не изменены. Разрешена попытка %s.",
+                     self.state["permit"])
 
     @contextlib.asynccontextmanager
     async def navigation(self, search: bool = True, url: str = ""):
@@ -612,29 +677,22 @@ class Gate:
                          request["type"], request["label"], time.monotonic()-self.last, request["url"])
 
 
-def release_old_pause(gate: Gate) -> bool:
-    """Start the browser even if an older run left a manual stop in the database."""
-    paused = bool(gate.state.get("manual")) or float(gate.state.get("until", 0)) > time.time()
-    if not paused:
-        return False
-    gate.state["manual"] = False
-    gate.state["until"] = 0
-    gate.persist()
-    return True
-
-
 def stretch_pace(store: Store, roster: Roster, search: dict, cap: float, step: float) -> float:
-    """Lengthen one search a little after Avito refuses or the page does not load."""
-    base = float(search.get("base_interval", search["interval"]))
+    """Lengthen one search a little. This never changes the shared Avito pause."""
+    old = float(search["interval"])
+    base = float(search.get("base_interval", old))
     ceiling = max(base, cap)
-    if search["interval"] < ceiling:
-        search["interval"] = min(ceiling, float(search["interval"]) + step)
-    roster.interval[search["key"]] = search["interval"]
+    new = min(ceiling, old + step) if old < ceiling else old
+    search["interval"] = new
+    roster.interval[search["key"]] = new
     saved = store.get_state("poll_pace")
-    saved[search["key"]] = search["interval"]
+    saved[search["key"]] = new
     store.set_state("poll_pace", saved)
-    LOG.info("Интервал «%s» увеличен до %s с", search["query"], int(search["interval"]))
-    return float(search["interval"])
+    if new > old:
+        LOG.info("Интервал «%s» увеличен до %s с", search["query"], int(new))
+    else:
+        LOG.info("Интервал «%s» остался %s с: предел уже достигнут", search["query"], int(old))
+    return new
 
 
 READY_JS = """() => !!document.querySelector('[data-marker="item"]') ||
@@ -921,20 +979,23 @@ async def scan_lane(context, store: Store, config: dict, chats: list[str], gate:
                     exc.request = request_info(search["url"], True)
                     gate.block(exc)
                 meta[key]["ok_streak"] = 0
-                if exc.manual:
-                    roster.set_due(key, time.monotonic() + 1)
-                else:
-                    wait_s = max(stretch_pace(store, roster, search, cap, step), float(exc.retry_after or 0))
-                    gate.ease(wait_s)
-                    roster.set_due(key, time.monotonic() + wait_s)
+                # Interval adaptation does not replace the shared pause. Gate.check decides.
+                stretch_pace(store, roster, search, cap, step)
+                roster.set_due(key, time.monotonic() + 1)
+                if gate.state.get("manual"):
+                    LOG.warning("Поиск «%s» остановлен до ручной проверки. Срок: %s",
+                                search["query"], gate.describe())
             except Exception as exc:
                 meta[key]["ok_streak"] = 0
                 if type(exc).__name__ == "TimeoutError":
                     wait_s = stretch_pace(store, roster, search, cap, step)
-                    gate.ease(wait_s)
                     roster.set_due(key, time.monotonic() + wait_s)
-                    LOG.warning("Страница «%s» не загрузилась. Следующее обновление через %s с",
-                                search["query"], int(wait_s))
+                    if gate.state.get("manual") or float(gate.state.get("until", 0) or 0) > time.time():
+                        LOG.warning("Страница «%s» не загрузилась. Общая остановка сохранена. %s",
+                                    search["query"], gate.describe())
+                    else:
+                        LOG.warning("Страница «%s» не загрузилась. Следующая попытка этого поиска через %s с",
+                                    search["query"], int(wait_s))
                 else:
                     roster.set_due(key, fail_search(store, gate, search, meta[key], exc, chats))
         finally:
@@ -1191,9 +1252,8 @@ async def run(args):
                     with contextlib.suppress(NotImplementedError):
                         loop.add_signal_handler(sig, stop.set)
                 bot = Telegram(token)
+                log_disabled_deliveries(store)
                 gate.announce_pause()
-                if release_old_pause(gate):
-                    LOG.info("Старая пауза снята. Браузер откроется и сам продолжит обновлять поиск.")
                 roster = Roster(config["searches"])
                 for search in config["searches"]:
                     delay = max(0.0, roster.due[search["key"]] - time.monotonic())
@@ -1201,7 +1261,7 @@ async def run(args):
                              search["query"], int(search["interval"]), delay,
                              "; приоритет, ссылка уходит сразу" if search["key"] == roster.primary else "")
                 primary = next(search for search in config["searches"] if search["key"] == roster.primary)
-                LOG.info("Мониторинг 1.8 запущен. Приоритетный поиск «%s» каждые %s с; "
+                LOG.info("Мониторинг 1.9 запущен. Приоритетный поиск «%s» каждые %s с; "
                          "между этими проверками не больше %s остальных запросов. "
                          "Описания: %s. Возможные варианты без подтверждения: %s.",
                          primary["query"], int(primary["interval"]),
@@ -1222,7 +1282,7 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Быстрые уведомления о книгах Авито → Telegram")
-    parser.add_argument("--version", action="version", version="Avito Book Watch 1.8 — refresh the priority search every 2 minutes")
+    parser.add_argument("--version", action="version", version="Avito Book Watch 1.9 — a 429 pause lasts at least 900s and survives restart")
     parser.add_argument("--config", type=Path, default=BASE / "config.json")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--probe", action="store_true", help="Один поиск без рассылки/начальной базы; состояние ограничения сохраняется")

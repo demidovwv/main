@@ -14,7 +14,7 @@ from avito_watch import (Item, Store, Telegram, TelegramProblem, PageProblem,
                          classify, parse_search, parse_description, make_search, scan_loop, Gate,
                          AccessLimited, AccessPaused, retry_after_seconds, navigate, browser_settings,
                          collect_search, request_info, detail_loop, Roster, scan_lane, load_config,
-                         message, SearchRead, release_old_pause, stretch_pace)
+                         message, SearchRead, stretch_pace, deliver_loop, log_disabled_deliveries)
 
 
 def sample(id="1234567890", title="Железное пламя", **kwargs):
@@ -208,6 +208,43 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(exc.retry_after, 42)
             self.assertNotIn("secret", str(exc))
         await bot.client.aclose()
+
+    async def test_delivery_error_and_disabled_row_are_logged_without_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "db.sqlite")
+            token = "123:super-secret-token"
+            bot = Telegram(token)
+            await bot.client.aclose()
+            bot.client = httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda request: httpx.Response(403, json={"ok": False, "error_code": 403, "description": "Forbidden"})))
+            try:
+                store.notice("k", "hello", ["11"])
+                stop = asyncio.Event()
+
+                async def halt():
+                    for _ in range(50):
+                        row = store.db.execute("SELECT disabled FROM outbox").fetchone()
+                        if row and row[0]:
+                            break
+                        await asyncio.sleep(0.02)
+                    stop.set()
+
+                with self.assertLogs("avito-watch", level="ERROR") as captured:
+                    await asyncio.gather(deliver_loop(store, bot, stop), halt())
+                text = "\n".join(captured.output)
+                self.assertIn("код 403", text)
+                self.assertIn("запись очереди отключена", text)
+                self.assertIn("chat 11", text)
+                self.assertNotIn("super-secret-token", text)
+                with self.assertLogs("avito-watch", level="ERROR") as disabled:
+                    log_disabled_deliveries(store)
+                disabled_text = "\n".join(disabled.output)
+                self.assertIn("Очередь Telegram отключена", disabled_text)
+                self.assertIn("chat=11", disabled_text)
+                self.assertNotIn("super-secret-token", disabled_text)
+            finally:
+                await bot.client.aclose()
+                store.close()
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -472,23 +509,73 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
-    async def test_repeated_429_keeps_running_and_a_hard_block_still_needs_resume(self):
-        gate = Gate(0)
+    def test_429_without_retry_after_pauses_at_least_900_seconds(self):
+        gate = Gate(0, cooldown=900)
         with patch("avito_watch.time.time", return_value=1000):
             gate.block(AccessLimited("HTTP 429"))
-            self.assertFalse(gate.state["manual"])
-        with patch("avito_watch.time.time", return_value=1901):
-            # Descriptions wait while the limit is remembered; the search itself may continue.
-            with self.assertRaises(AccessPaused):
-                gate.check(search=False)
-            gate.check(search=True)
-            gate.block(AccessLimited("HTTP 429", retry_after=50))
-            self.assertFalse(gate.state["manual"])
-            self.assertEqual(gate.state["until"], 1951)
-        gate.block(AccessLimited("HTTP 403", manual=True))
+        self.assertEqual(gate.state["until"], 1900)
+        self.assertGreaterEqual(gate.state["until"] - 1000, 900)
+        self.assertFalse(gate.state["manual"])
+        self.assertEqual(gate.state["strikes"], 1)
+
+    def test_longer_retry_after_is_respected(self):
+        gate = Gate(0, cooldown=900)
+        with patch("avito_watch.time.time", return_value=1000):
+            gate.block(AccessLimited("HTTP 429", retry_after=3600))
+        self.assertEqual(gate.state["until"], 4600)
+        self.assertFalse(gate.state["manual"])
+
+    def test_second_429_is_manual_and_restart_or_resume_keep_the_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "db.sqlite"
+            store = Store(path)
+            try:
+                gate = Gate(0, store, ["11", "22"], cooldown=900)
+                with patch("avito_watch.time.time", return_value=1000):
+                    gate.block(AccessLimited("HTTP 429"))
+                    self.assertEqual(gate.state["until"], 1900)
+                with patch("avito_watch.time.time", return_value=1901):
+                    with self.assertRaises(AccessPaused):
+                        gate.check(search=False)
+                    gate.check(search=True)
+                    gate.block(AccessLimited("HTTP 429"))
+                self.assertTrue(gate.state["manual"])
+                self.assertEqual(gate.state["strikes"], 2)
+                self.assertEqual(gate.state["until"], 3701)
+                deadline = gate.state["until"]
+                reason = gate.state["reason"]
+                reopened = Store(path)
+                try:
+                    restarted = Gate(0, reopened, ["11", "22"], cooldown=900)
+                    self.assertEqual(restarted.state["until"], deadline)
+                    self.assertTrue(restarted.state["manual"])
+                    self.assertEqual(restarted.state["strikes"], 2)
+                    self.assertEqual(restarted.state["reason"], reason)
+                    restarted.resume()
+                    self.assertFalse(restarted.state["manual"])
+                    self.assertEqual(restarted.state["until"], deadline)
+                    self.assertEqual(restarted.state["strikes"], 2)
+                    with patch("avito_watch.time.time", return_value=2000):
+                        with self.assertRaises(AccessPaused):
+                            restarted.check()
+                    with patch("avito_watch.time.time", return_value=3701):
+                        restarted.check(search=True)
+                        with self.assertRaises(AccessPaused):
+                            restarted.check(search=False)
+                finally:
+                    reopened.close()
+            finally:
+                store.close()
+
+    def test_failed_probe_keeps_the_original_reason_and_stops(self):
+        gate = Gate(0, cooldown=900)
+        gate.state = {"strikes": 1, "episode": "episode", "permit": 0, "until": 5000,
+                      "manual": False, "reason": "Авито вернул HTTP 429", "request": {}}
+        gate.inconclusive_probe()
         self.assertTrue(gate.state["manual"])
-        with self.assertRaises(AccessPaused):
-            gate.check()
+        self.assertEqual(gate.state["reason"], "Авито вернул HTTP 429")
+        self.assertEqual(gate.state["until"], 5000)
+        self.assertEqual(gate.state["strikes"], 1)
 
     async def test_successful_search_clears_recovery_and_403_requires_manual_check(self):
         gate = Gate(0)
@@ -542,12 +629,101 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
                 normal_gate.announce_pause()
                 self.assertEqual(store.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 2)
                 first = store.next_delivery()
-                self.assertIn("обновит страницу сама", first["body"])
+                self.assertIn("Общая остановка", first["body"])
+                self.assertIn("одна проверка поиска", first["body"])
                 store.delivered(first, 101)
                 second = store.next_delivery()
                 store.delivered(second, 102)
                 normal_gate.announce_pause()
                 self.assertIsNone(store.next_delivery())
+            finally:
+                store.close()
+
+    def test_new_recovery_attempt_notifies_both_recipients_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "db.sqlite")
+            try:
+                gate = Gate(0, store, ["11", "22"], cooldown=900)
+                with patch("avito_watch.time.time", return_value=1000), self.assertLogs("avito-watch", level="INFO") as first:
+                    gate.block(AccessLimited("HTTP 429"))
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 2)
+                self.assertTrue(any("поставлено в очередь" in line for line in first.output))
+                while row := store.next_delivery():
+                    self.assertIn(row["chat_id"], ("11", "22"))
+                    store.delivered(row, 10)
+                with patch("avito_watch.time.time", return_value=1000), self.assertLogs("avito-watch", level="INFO") as again:
+                    gate.announce_pause()
+                self.assertIsNone(store.next_delivery())
+                self.assertTrue(any("подавлен" in line for line in again.output))
+                deadline = gate.state["until"]
+                strikes = gate.state["strikes"]
+                gate.resume()
+                self.assertEqual(gate.state["until"], deadline)
+                self.assertEqual(gate.state["strikes"], strikes)
+                self.assertEqual(gate.state["permit"], 1)
+                with patch("avito_watch.time.time", return_value=1500), self.assertLogs("avito-watch", level="INFO") as held:
+                    gate.announce_pause()
+                self.assertIsNone(store.next_delivery())
+                self.assertTrue(any("подавлен" in line for line in held.output))
+                restarted = Gate(0, store, ["11", "22"], cooldown=900)
+                restarted.announce_pause()
+                self.assertIsNone(store.next_delivery())
+                self.assertEqual(restarted.state["until"], deadline)
+                with patch("avito_watch.time.time", return_value=2000):
+                    gate.block(AccessLimited("HTTP 429"))
+                fresh = []
+                while row := store.next_delivery():
+                    fresh.append(row["chat_id"])
+                    self.assertIn("Общая остановка", row["body"])
+                    store.delivered(row, 20 + len(fresh))
+                self.assertEqual(sorted(fresh), ["11", "22"])
+                with patch("avito_watch.time.time", return_value=2000), self.assertLogs("avito-watch", level="INFO") as third:
+                    gate.block(AccessLimited("HTTP 429"))
+                self.assertIsNone(store.next_delivery())
+                self.assertTrue(any("подавлен" in line for line in third.output))
+                self.assertEqual(gate.state["strikes"], 3)
+                self.assertGreaterEqual(gate.state["until"], deadline)
+                self.assertIn(":p1:", gate.state["notice_key"])
+            finally:
+                store.close()
+
+    def test_legacy_episode_key_stays_quiet_until_a_new_attempt_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "db.sqlite")
+            try:
+                episode = "episode-17"
+                legacy = "avito-access:" + episode + ":pause"
+                store.notice(legacy, "старое уведомление", ["11", "22"])
+                while row := store.next_delivery():
+                    store.delivered(row, 5)
+                store.set_state("avito_access", {
+                    "strikes": 1, "episode": episode, "until": 5000, "manual": False,
+                    "reason": "Авито вернул HTTP 429", "request": {},
+                })
+                gate = Gate(0, store, ["11", "22"], cooldown=900)
+                with self.assertLogs("avito-watch", level="INFO") as restart:
+                    gate.announce_pause()
+                self.assertIsNone(store.next_delivery())
+                self.assertTrue(any("подавлен" in line or "уже записанному" in line for line in restart.output))
+                self.assertEqual(gate.state["notice_key"], legacy)
+                deadline = gate.state["until"]
+                gate.resume()
+                gate.announce_pause()
+                self.assertIsNone(store.next_delivery())
+                self.assertEqual(gate.state["until"], deadline)
+                self.assertEqual(gate.state["strikes"], 1)
+                self.assertEqual(gate.state["permit"], 1)
+                with patch("avito_watch.time.time", return_value=5100):
+                    gate.block(AccessLimited("HTTP 429"))
+                fresh = []
+                while row := store.next_delivery():
+                    fresh.append(row["chat_id"])
+                    self.assertIn("Общая остановка", row["body"])
+                    self.assertNotIn("secret-token", row["body"])
+                    store.delivered(row, 30 + len(fresh))
+                self.assertEqual(sorted(fresh), ["11", "22"])
+                self.assertNotEqual(gate.state["notice_key"], legacy)
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 4)
             finally:
                 store.close()
 
@@ -650,19 +826,23 @@ class StableScheduleTests(unittest.IsolatedAsyncioTestCase):
             if previous == "S":
                 self.assertEqual(current, "P")
 
-    def test_old_manual_pause_releases_and_timeout_lengthens_interval(self):
-        gate = Gate(0)
-        gate.state = {"manual": True, "until": time.time() + 3600, "strikes": 1, "reason": "старая пауза"}
-        self.assertTrue(release_old_pause(gate))
-        self.assertFalse(gate.state["manual"])
-        self.assertEqual(gate.state["until"], 0)
-        gate.check(search=True)
+    def test_interval_at_cap_is_not_reported_as_increased(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "t.db")
+            search = make_search({"query": "Железное пламя", "interval_seconds": 120}, 120)
+            roster = Roster([search])
+            try:
+                with self.assertLogs("avito-watch", level="INFO") as captured:
+                    self.assertEqual(stretch_pace(store, roster, search, 120, 15), 120)
+                text = "\n".join(captured.output)
+                self.assertNotIn("увеличен", text)
+                self.assertIn("остался", text)
+                self.assertEqual(search["interval"], 120)
+            finally:
+                store.close()
 
-    async def test_timeout_lengthens_the_refresh_and_does_not_stop(self):
+    async def test_timeout_does_not_lift_a_global_pause(self):
         stop = asyncio.Event()
-
-        async def time_out(page, url, gate, search):
-            raise TimeoutError("page.goto")
 
         class Page:
             async def content(self):
@@ -676,24 +856,51 @@ class StableScheduleTests(unittest.IsolatedAsyncioTestCase):
             store = Store(Path(tmp) / "t.db")
             search = make_search({"query": "Железное пламя", "interval_seconds": 120}, 120)
             config = {"search_concurrency": 1, "notify_candidates": False, "fetch_descriptions": False,
-                      "max_secondary_per_cycle": 1, "interval_cap_seconds": 180, "interval_step_seconds": 15,
+                      "max_secondary_per_cycle": 1, "interval_cap_seconds": 120, "interval_step_seconds": 15,
                       "searches": [search]}
             roster = Roster(config["searches"])
-            gate = Gate(0, store, ["11"])
+            gate = Gate(0, store, ["11"], cooldown=900)
+            deadline = time.time() + 900
+            gate.state = {"strikes": 2, "episode": "episode", "permit": 0, "until": deadline,
+                          "manual": True, "reason": "Авито вернул HTTP 429", "request": {}}
+            gate.persist()
 
-            async def stopper():
-                await asyncio.sleep(0.3)
+            async def time_out_and_stop(page, url, gate, search):
                 stop.set()
+                raise TimeoutError("page.goto")
 
             try:
-                with patch("avito_watch.navigate", time_out):
-                    await asyncio.gather(scan_lane(
-                        Context(), store, config, ["11"], gate, stop, "baseline", roster), stopper())
-                self.assertEqual(search["interval"], 135)
-                self.assertFalse(gate.state.get("manual", False))
-                self.assertGreater(gate.state.get("until", 0), time.time())
+                with patch("avito_watch.navigate", time_out_and_stop), self.assertLogs("avito-watch", level="INFO") as captured:
+                    await asyncio.wait_for(scan_lane(
+                        Context(), store, config, ["11"], gate, stop, "baseline", roster), timeout=4)
+                text = "\n".join(captured.output)
+                self.assertIn("Общая остановка сохранена", text)
+                self.assertNotIn("увеличен", text)
+                self.assertTrue(gate.state["manual"])
+                self.assertEqual(gate.state["until"], deadline)
+                self.assertEqual(gate.state["reason"], "Авито вернул HTTP 429")
+                self.assertEqual(gate.state["strikes"], 2)
+                self.assertEqual(search["interval"], 120)
             finally:
                 store.close()
+
+    async def test_probe_timeout_keeps_reason_and_requires_resume(self):
+        gate = Gate(0, cooldown=900)
+        gate.state = {"strikes": 1, "episode": "episode", "permit": 0, "until": 5000,
+                      "manual": False, "reason": "Авито вернул HTTP 429", "request": {}}
+
+        class Page:
+            async def goto(self, url, **kwargs):
+                raise TimeoutError("page.goto")
+
+        with self.assertRaises(TimeoutError):
+            await navigate(Page(), "https://www.avito.ru/all?q=probe", gate, True)
+        self.assertTrue(gate.state["manual"])
+        self.assertEqual(gate.state["until"], 5000)
+        self.assertEqual(gate.state["reason"], "Авито вернул HTTP 429")
+        self.assertEqual(gate.state["strikes"], 1)
+        with self.assertRaises(AccessPaused):
+            gate.check()
 
     async def test_description_waits_while_priority_search_is_due(self):
         context = type("Context", (), {"new_page": AsyncMock(return_value=object())})()
