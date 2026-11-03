@@ -14,7 +14,8 @@ from avito_watch import (Item, Store, Telegram, TelegramProblem, PageProblem,
                          classify, parse_search, parse_description, make_search, scan_loop, Gate,
                          AccessLimited, AccessPaused, retry_after_seconds, navigate, browser_settings,
                          collect_search, request_info, detail_loop, Roster, scan_lane, load_config,
-                         message, SearchRead, stretch_pace, deliver_loop, log_disabled_deliveries)
+                         message, SearchRead, stretch_pace, deliver_loop, log_disabled_deliveries,
+                         retry_after_note)
 
 
 def sample(id="1234567890", title="Железное пламя", **kwargs):
@@ -494,6 +495,8 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(results[1], AccessPaused)
                     self.assertEqual(page.goto.await_count, 1)
                     self.assertEqual(gate.state["until"], 4600)
+                    self.assertEqual(gate.state["retry_after_header"], "3600")
+                    self.assertEqual(gate.state["pause_seconds"], 3600)
                     with self.assertRaises(AccessPaused):
                         await navigate(page, "https://www.avito.ru/book_1234567890", gate, False)
                     self.assertEqual(page.goto.await_count, 1)
@@ -511,19 +514,48 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
 
     def test_429_without_retry_after_pauses_at_least_900_seconds(self):
         gate = Gate(0, cooldown=900)
-        with patch("avito_watch.time.time", return_value=1000):
+        with patch("avito_watch.time.time", return_value=1000), self.assertLogs("avito-watch", level="WARNING") as captured:
             gate.block(AccessLimited("HTTP 429"))
+        text = "\n".join(captured.output)
         self.assertEqual(gate.state["until"], 1900)
         self.assertGreaterEqual(gate.state["until"] - 1000, 900)
         self.assertFalse(gate.state["manual"])
         self.assertEqual(gate.state["strikes"], 1)
+        self.assertEqual(gate.state["own_pause"], 900)
+        self.assertEqual(gate.state["pause_seconds"], 900)
+        self.assertEqual(gate.state["retry_after_header"], "")
+        self.assertIn("заголовка Retry-After нет", text)
+        self.assertIn("отказ 1 из серии", text)
+        self.assertIn("выбран срок 900 с", text)
 
     def test_longer_retry_after_is_respected(self):
         gate = Gate(0, cooldown=900)
-        with patch("avito_watch.time.time", return_value=1000):
-            gate.block(AccessLimited("HTTP 429", retry_after=3600))
+        exc = AccessLimited("HTTP 429", retry_after=3600, retry_after_raw="3600")
+        with patch("avito_watch.time.time", return_value=1000), self.assertLogs("avito-watch", level="WARNING") as captured:
+            gate.block(exc)
+        text = "\n".join(captured.output)
         self.assertEqual(gate.state["until"], 4600)
         self.assertFalse(gate.state["manual"])
+        self.assertEqual(gate.state["own_pause"], 900)
+        self.assertEqual(gate.state["pause_seconds"], 3600)
+        self.assertEqual(gate.state["retry_after_header"], "3600")
+        self.assertIn("Retry-After «3600» учтён как 3600 с", text)
+
+    def test_third_strike_logs_3600_seconds_when_header_is_absent(self):
+        gate = Gate(0, cooldown=900)
+        gate.state = {"strikes": 2, "episode": "episode", "permit": 0, "until": 0,
+                      "manual": True, "reason": "Авито вернул HTTP 429"}
+        with patch("avito_watch.time.time", return_value=1_778_000_000), self.assertLogs("avito-watch", level="WARNING") as captured:
+            gate.block(AccessLimited("Авито вернул HTTP 429"))
+        text = "\n".join(captured.output)
+        self.assertEqual(gate.state["strikes"], 3)
+        self.assertEqual(gate.state["own_pause"], 3600)
+        self.assertEqual(gate.state["pause_seconds"], 3600)
+        self.assertEqual(gate.state["until"], 1_778_000_000 + 3600)
+        self.assertIn("отказ 3 из серии", text)
+        self.assertIn("своя пауза 3600 с", text)
+        self.assertIn("заголовка Retry-After нет", text)
+        self.assertIn("не разобран", retry_after_note(AccessLimited("x", retry_after_raw="скоро")))
 
     def test_second_429_is_manual_and_restart_or_resume_keep_the_deadline(self):
         with tempfile.TemporaryDirectory() as tmp:

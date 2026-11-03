@@ -81,9 +81,11 @@ class PageProblem(Exception):
 
 
 class AccessLimited(PageProblem):
-    def __init__(self, reason: str, retry_after: float = 0, manual: bool = False):
+    def __init__(self, reason: str, retry_after: float = 0, manual: bool = False,
+                 retry_after_raw: str | None = None):
         super().__init__(reason)
         self.retry_after, self.manual = retry_after, manual
+        self.retry_after_raw = retry_after_raw
         self.handled = False
         self.request = {}
 
@@ -104,6 +106,20 @@ def request_info(url: str, search: bool) -> dict:
     ident = re.search(r"_(\d{5,})/?$", p.path)
     return {"type": "поиск" if search else "описание",
             "label": clean(query or (ident[1] if ident else p.path), 160), "url": public_url}
+
+
+def retry_after_note(exc: AccessLimited) -> str:
+    """Say whether Avito sent Retry-After, without changing the pause."""
+    raw = getattr(exc, "retry_after_raw", None)
+    parsed = float(getattr(exc, "retry_after", 0) or 0)
+    if raw is None or str(raw).strip() == "":
+        if parsed > 0:
+            return f"Retry-After учтён как {int(parsed)} с"
+        return "заголовка Retry-After нет"
+    text = " ".join(str(raw).split())[:120]
+    if parsed > 0:
+        return f"Retry-After «{text}» учтён как {int(parsed)} с"
+    return f"Retry-After «{text}» не разобран и не удлиняет паузу"
 
 
 def retry_after_seconds(value: str | None, now: float | None = None) -> float:
@@ -590,15 +606,23 @@ class Gate:
         strikes = int(self.state.get("strikes", 0) or 0) + 1
         episode = self.state.get("episode") or str(time.time_ns())
         permit = int(self.state.get("permit", 0) or 0)
-        delay = max(self.cooldown * 2**min(strikes - 1, 4), float(exc.retry_after or 0))
+        own_pause = self.cooldown * 2**min(strikes - 1, 4)
+        retry = float(exc.retry_after or 0)
+        delay = max(own_pause, retry)
         until = max(previous_until, time.time() + delay)
         manual = previous_manual or bool(exc.manual) or strikes >= 2
+        raw = getattr(exc, "retry_after_raw", None)
         self.state = {"strikes": strikes, "episode": episode, "permit": permit,
                       "until": until, "manual": manual, "reason": str(exc),
-                      "request": dict(exc.request or {})}
+                      "request": dict(exc.request or {}),
+                      "retry_after": retry,
+                      "retry_after_header": "" if raw is None else " ".join(str(raw).split())[:120],
+                      "own_pause": own_pause, "pause_seconds": delay}
         self.state["notice_key"] = self.pause_notice_key()
         self.persist()
         LOG.warning("Все обращения к Авито остановлены. %s", self.describe())
+        LOG.warning("Расчёт паузы: отказ %s из серии, своя пауза %s с, %s, выбран срок %s с.",
+                    strikes, int(own_pause), retry_after_note(exc), int(delay))
         self.announce_pause()
 
     def announce_pause(self):
@@ -707,14 +731,16 @@ async def navigate(page, url: str, gate: Gate, search: bool):
     async with gate.navigation(search, url):
         response = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
         if response:
-            retry = retry_after_seconds(response.headers.get("retry-after"))
+            raw_retry = response.headers.get("retry-after")
+            retry = retry_after_seconds(raw_retry)
             if response.status == 429:
-                raise AccessLimited("Авито вернул HTTP 429", retry_after=retry)
+                raise AccessLimited("Авито вернул HTTP 429", retry_after=retry, retry_after_raw=raw_retry)
             if response.status in (403, 439):
                 # 439 has no standard HTTP meaning. We only know the search
                 # was refused; stop for inspection rather than retrying queries
                 # or claiming the VPN IP is the cause.
-                raise AccessLimited(f"Авито вернул HTTP {response.status}", retry_after=retry, manual=True)
+                raise AccessLimited(f"Авито вернул HTTP {response.status}", retry_after=retry,
+                                    manual=True, retry_after_raw=raw_retry)
             if response.status >= 400:
                 raise PageProblem(f"Авито вернул HTTP {response.status}",
                                   retryable=response.status >= 500 or response.status == 408)
@@ -1261,7 +1287,7 @@ async def run(args):
                              search["query"], int(search["interval"]), delay,
                              "; приоритет, ссылка уходит сразу" if search["key"] == roster.primary else "")
                 primary = next(search for search in config["searches"] if search["key"] == roster.primary)
-                LOG.info("Мониторинг 1.9 запущен. Приоритетный поиск «%s» каждые %s с; "
+                LOG.info("Мониторинг 1.10 запущен. Приоритетный поиск «%s» каждые %s с; "
                          "между этими проверками не больше %s остальных запросов. "
                          "Описания: %s. Возможные варианты без подтверждения: %s.",
                          primary["query"], int(primary["interval"]),
@@ -1282,7 +1308,7 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Быстрые уведомления о книгах Авито → Telegram")
-    parser.add_argument("--version", action="version", version="Avito Book Watch 1.9 — a 429 pause lasts at least 900s and survives restart")
+    parser.add_argument("--version", action="version", version="Avito Book Watch 1.10 — a 429 pause logs Retry-After and the calculated wait")
     parser.add_argument("--config", type=Path, default=BASE / "config.json")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--probe", action="store_true", help="Один поиск без рассылки/начальной базы; состояние ограничения сохраняется")
