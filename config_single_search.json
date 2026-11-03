@@ -1,0 +1,20 @@
+{
+  "interval_seconds": 120,
+  "navigation_gap_seconds": 8,
+  "search_concurrency": 1,
+  "notify_candidates": false,
+  "max_secondary_per_cycle": 1,
+  "interval_step_seconds": 15,
+  "interval_cap_seconds": 120,
+  "searches": [
+    {
+      "query": "Железное пламя",
+      "interval_seconds": 120
+    }
+  ],
+  "cooldown_seconds": 900,
+  "fetch_descriptions": false,
+  "detail_max_attempts": 2,
+  "detail_retry_seconds": 900,
+  "detail_min_gap_seconds": 60
+}
