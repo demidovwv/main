@@ -1,5 +1,5 @@
-Version 1.9, 03.11.2026
-46 offline tests passed; Python compilation and --version passed.
-A 429 without Retry-After pauses every Avito request for at least 900 seconds. A longer Retry-After is kept. A second 429, HTTP 403, HTTP 439, or an access check sets a manual stop. Restart keeps the deadline, reason, strike count and manual flag. --resume clears only the manual flag and does not shorten the deadline. A timeout does not lift that stop. An interval already at 120 seconds is not reported as increased. Service notices go to both recipients once per pause key; a new permitted attempt can notify again, and a repeated hit in the same stop does not.
-No production watch.sqlite3 is present in this workspace, so the old episode key was checked with a fixture, not the remote database. .env, data and the browser profile were not modified. Happ, the monitor and live Avito were not started.
+Version 1.10, 03.11.2026
+47 offline tests passed; Python compilation and --version passed.
+A 429 without Retry-After pauses every Avito request for at least 900 seconds. A longer Retry-After is kept. The log and saved state record the strike number, the script's own pause, the Retry-After header, and the chosen wait. A second 429, HTTP 403, HTTP 439, or an access check sets a manual stop. Restart keeps the deadline, reason, strike count and manual flag. --resume clears only the manual flag and does not shorten the deadline or the strike count. A timeout does not lift that stop. An interval already at 120 seconds is not reported as increased. Service notices go to both recipients once per pause key.
+No production watch.sqlite3 is present in this workspace. .env, data and the browser profile were not modified. Happ, the monitor and live Avito were not started.
 Real Avito access remains unverified here.
